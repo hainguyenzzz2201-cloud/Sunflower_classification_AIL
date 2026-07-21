@@ -9,7 +9,7 @@ Pipeline:
 2. Trích xuất đặc trưng: HOG, Color Histogram (HSV), LBP, GLCM,
    tỉ lệ vùng màu đĩa hoa (disk-region color ratio)
 3. Train nhiều mô hình: SVM, Random Forest, KNN, Logistic Regression,
-   Gradient Boosting, XGBoost, Naive Bayes
+   Naive Bayes
 4. Đánh giá & so sánh bằng Cross-Validation + Test set
 5. Lưu model tốt nhất ra .pkl
 
@@ -36,17 +36,11 @@ from sklearn.pipeline import Pipeline
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.svm import SVC
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import GaussianNB
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
-
-try:
-    from xgboost import XGBClassifier
-    HAS_XGB = True
-except ImportError:
-    HAS_XGB = False
 
 import matplotlib
 matplotlib.use("Agg")
@@ -64,6 +58,7 @@ OUTPUT_DIR = "outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 GROUPS_CSV = "groups.csv"   # tạo bằng compute_groups.py - chạy script đó TRƯỚC file này
+N_REPEATS_IMPORTANCE = 8    # số lần xáo trộn (permutation) khi đo tầm quan trọng đặc trưng
 
 
 # =====================================================================
@@ -285,6 +280,80 @@ def extract_features_from_image(image_path):
                            sat_feat, bright_feat])
 
 
+def compute_feature_group_slices():
+    """
+    Xác định vị trí (start, end) của từng NHÓM đặc trưng bên trong vector
+    feature gộp (đúng theo thứ tự concatenate trong extract_features_from_image).
+
+    Tính TỰ ĐỘNG bằng cách chạy thử các hàm extract_* trên 1 ảnh rỗng, thay vì
+    hardcode số chiều — để luôn khớp thực tế kể cả khi bạn đổi tham số HOG/LBP/...
+
+    Trả về: dict {tên_nhóm: (start_idx, end_idx)}
+    """
+    dummy = np.zeros((IMAGE_SIZE[1], IMAGE_SIZE[0], 3), dtype=np.uint8)
+    _, gray, hsv = preprocess_image(dummy)
+
+    ordered_groups = [
+        ("Color Histogram (HSV)",  extract_color_histogram(hsv)),
+        ("HOG (hình dạng/cạnh)",   extract_hog_features(gray)),
+        ("LBP (texture)",          extract_lbp_features(gray)),
+        ("GLCM (texture thống kê)", extract_glcm_features(gray)),
+        ("Disk Color Ratio",       extract_disk_color_ratio(hsv)),
+        ("Center vs Border",       extract_center_vs_border(hsv)),
+        ("Petal Edge Density",     extract_petal_edge_density(gray)),
+        ("Saturation Stats",       extract_saturation_stats(hsv)),
+        ("Brightness Stats",       extract_brightness_features(gray, hsv)),
+    ]
+
+    slices, idx = {}, 0
+    for name, arr in ordered_groups:
+        length = len(arr)
+        slices[name] = (idx, idx + length)
+        idx += length
+    return slices
+
+
+def grouped_permutation_importance(pipeline, X, y, feature_slices,
+                                    scoring="f1_macro", n_repeats=8, random_state=42):
+    """
+    Đo tầm quan trọng của từng NHÓM đặc trưng (Color Histogram, HOG, LBP, ...)
+    đối với 1 model cụ thể, bằng Grouped Permutation Importance:
+
+    - Với mỗi nhóm đặc trưng: xáo trộn (permute) toàn bộ các cột thuộc nhóm đó
+      giữa các mẫu trong X, rồi đo hiệu năng (F1-macro / Accuracy) giảm bao nhiêu
+      so với baseline (không xáo trộn).
+    - Giảm càng nhiều  →  nhóm đặc trưng đó càng QUAN TRỌNG với model.
+
+    Ưu điểm so với coef_ / feature_importances_ thô:
+    - Hoạt động với MỌI model (SVM, KNN, Naive Bayes, ...), kể cả khi model
+      không có coef_/feature_importances_.
+    - Đo trực tiếp trên feature GỐC, nên vẫn đúng dù pipeline có PCA ở giữa
+      (PCA trộn lẫn các chiều nên coef_/feature_importances_ sau PCA không thể
+      map ngược về từng đặc trưng gốc một cách trực tiếp).
+
+    Trả về: dict {tên_nhóm: mức_giảm_hiệu_năng_trung_bình}
+    """
+    rng = np.random.RandomState(random_state)
+
+    def _score(X_):
+        y_pred = pipeline.predict(X_)
+        if scoring == "f1_macro":
+            return f1_score(y, y_pred, average="macro")
+        return accuracy_score(y, y_pred)
+
+    baseline = _score(X)
+    importances = {}
+    for group_name, (start, end) in feature_slices.items():
+        drops = []
+        for _ in range(n_repeats):
+            X_perm = X.copy()
+            perm_order = rng.permutation(X.shape[0])
+            X_perm[:, start:end] = X_perm[perm_order, start:end]
+            drops.append(baseline - _score(X_perm))
+        importances[group_name] = float(np.mean(drops))
+    return importances
+
+
 def build_dataset(dataset_dir, class_names):
     """Quét thư mục, trích xuất feature cho toàn bộ ảnh."""
     X, y, paths = [], [], []
@@ -375,19 +444,8 @@ def get_models():
             max_samples=0.8,       # bagging: mỗi cây chỉ thấy 80% mẫu
             random_state=RANDOM_STATE
         ),
-        "Gradient Boosting": GradientBoostingClassifier(
-            n_estimators=200, learning_rate=0.05, max_depth=4,
-            subsample=0.8, random_state=RANDOM_STATE
-        ),
         "Naive Bayes": GaussianNB(),
     }
-    if HAS_XGB:
-        base_models["XGBoost"] = XGBClassifier(
-            n_estimators=200, learning_rate=0.05, max_depth=5,
-            subsample=0.8, colsample_bytree=0.8,
-            random_state=RANDOM_STATE, eval_metric="mlogloss",
-            use_label_encoder=False
-        )
     # Bọc tất cả vào Pipeline
     return {name: make_pipeline(m) for name, m in base_models.items()}
 
@@ -407,20 +465,7 @@ PARAM_GRIDS = {
         "clf__max_features":      ["sqrt", "log2"],
         "clf__max_samples":       [0.7, 0.8, 1.0],      # bagging sub-sampling
     },
-    "Gradient Boosting": {
-        "clf__n_estimators":  [100, 200, 300],
-        "clf__learning_rate": [0.03, 0.05, 0.1],
-        "clf__max_depth":     [3, 4, 5],
-        "clf__subsample":     [0.7, 0.8, 1.0],
-    },
     "Naive Bayes": {},
-    "XGBoost": {
-        "clf__n_estimators":     [100, 200],
-        "clf__learning_rate":    [0.03, 0.05, 0.1],
-        "clf__max_depth":        [3, 5, 7],
-        "clf__subsample":        [0.7, 0.8],
-        "clf__colsample_bytree": [0.7, 0.8],
-    },
 }
 
 
@@ -475,6 +520,10 @@ def main():
     cv = GroupKFold(n_splits=5)
     results = []
 
+    # Vị trí từng NHÓM đặc trưng trong vector gộp — dùng để đo tầm quan trọng
+    feature_slices = compute_feature_group_slices()
+    feature_importance_records = {}   # {model_name: {group_name: mean_drop}}
+
     for name, model in models.items():
         # CV trên raw feature — Pipeline tự scale + PCA bên trong
         cv_scores = cross_val_score(model, X_train, y_train, cv=cv, groups=groups_train,
@@ -499,8 +548,46 @@ def main():
         print(f"  {name:22s} | Train: {train_acc:.4f} | CV: {cv_scores.mean():.4f} ± {cv_scores.std():.4f} "
               f"| Test: {test_acc:.4f} | F1: {test_f1:.4f} | Gap: {overfit_gap:+.4f} {flag}")
 
+        # ── Tầm quan trọng của từng NHÓM đặc trưng cho model này ──────────
+        imp = grouped_permutation_importance(
+            model, X_test, y_test, feature_slices,
+            n_repeats=N_REPEATS_IMPORTANCE, random_state=RANDOM_STATE
+        )
+        feature_importance_records[name] = imp
+        top_group = max(imp, key=imp.get)
+        print(f"      → Đặc trưng quan trọng nhất: {top_group} "
+              f"(F1-macro giảm {imp[top_group]:+.4f} khi bị xáo trộn)")
+
     results_df = pd.DataFrame(results).sort_values("Test F1 (macro)", ascending=False).reset_index(drop=True)
     results_df.to_csv(os.path.join(OUTPUT_DIR, "model_comparison.csv"), index=False)
+
+    # ===================================================================
+    # BẢNG TẦM QUAN TRỌNG CỦA TỪNG ĐẶC TRƯNG CHO MỖI MODEL
+    # ===================================================================
+    print("\n" + "=" * 70)
+    print("THỐNG KÊ: MỨC ĐỘ QUAN TRỌNG CỦA TỪNG NHÓM ĐẶC TRƯNG (theo model)")
+    print("(Giá trị = F1-macro giảm bao nhiêu khi xáo trộn nhóm đặc trưng đó trên")
+    print(" tập Test — càng cao (dương) càng quan trọng; ~0 hoặc âm = ít/không quan trọng)")
+    print("=" * 70)
+    importance_df = pd.DataFrame(feature_importance_records)   # index=nhóm, cột=model
+    importance_df["Trung bình (tất cả model)"] = importance_df.mean(axis=1)
+    importance_df = importance_df.sort_values("Trung bình (tất cả model)", ascending=False)
+    print(importance_df.round(4).to_string())
+    importance_df.to_csv(os.path.join(OUTPUT_DIR, "feature_importance_by_model.csv"))
+    print(f"\n💾 Đã lưu bảng chi tiết vào: {OUTPUT_DIR}/feature_importance_by_model.csv")
+
+    # ── Heatmap tầm quan trọng đặc trưng theo từng model ──────────────────
+    plt.figure(figsize=(1.1 * len(models) + 3, 5))
+    sns.heatmap(importance_df.drop(columns=["Trung bình (tất cả model)"]),
+                annot=True, fmt=".3f", cmap="YlOrBr",
+                cbar_kws={"label": "F1-macro giảm khi xáo trộn"})
+    plt.title("Tầm quan trọng của từng nhóm đặc trưng theo từng Model")
+    plt.ylabel("Nhóm đặc trưng")
+    plt.xlabel("Model")
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "feature_importance_heatmap.png"), dpi=150)
+    plt.close()
+    print(f"💾 Đã lưu heatmap vào: {OUTPUT_DIR}/feature_importance_heatmap.png")
 
     print("\n" + "=" * 70)
     print("BẢNG XẾP HẠNG MODEL (theo Test F1-macro)")

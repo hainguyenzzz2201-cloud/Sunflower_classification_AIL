@@ -54,4 +54,5 @@ if __name__ == "__main__":
     predict(r"D:\SU26\AIL303m\Model3 for Sunflower\test_image_early2.jpg")
     predict(r"D:\SU26\AIL303m\Model3 for Sunflower\test_image_early3.jpg")
     predict(r"D:\SU26\AIL303m\Model3 for Sunflower\test_image_full.jpg")
+    predict(r"D:\SU26\AIL303m\Model3 for Sunflower\test_image_full2.jpg")
     predict(r"D:\SU26\AIL303m\Model3 for Sunflower\test_image.jpg")
